@@ -1,83 +1,102 @@
-name: Build Packages (Lua版 luci-app-openlist)
+name: Build luci-app-openlist IPK (OpenWrt 21.02.7)
 
+# 触发条件：手动触发 + 标签推送
 on:
   workflow_dispatch:
     inputs:
       tag:
         description: 'Release tag (e.g. v1.0.0)'
         required: false
-        default: 'latest-lua'
+        default: 'latest'
   push:
     tags:
-      - "*"  # 推送任意标签时触发
+      - "*"
 
 jobs:
-  build:
-    name: Build ${{ matrix.sdk }}-${{ matrix.arch }}
-    runs-on: ubuntu-latest
+  build-ipk:
+    name: Build ${{ matrix.sdk }}-${{ matrix.arch }} IPK
+    runs-on: ubuntu-20.04  # 适配OpenWrt 21.02.7 SDK（旧版SDK兼容20.04）
     strategy:
       fail-fast: false
       matrix:
-        arch:
-          - aarch64_cortex-a53
-        sdk:
-          - openwrt-21.02  # 若需适配旧版OpenWrt，可添加如openwrt-22.03等SDK版本
+        # 可根据需要扩展架构，此处以aarch64_cortex-a53为例
+        arch: [aarch64_cortex-a53]
+        sdk: [openwrt-21.02.7]
 
     steps:
-      - name: Checkout code
+      # 步骤1：检出当前代码库的luci-app-openlist源码
+      - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          path: openwrt-packages/luci-app-openlist  # 精准指向应用源码目录
 
-      - name: Install UPX (dependency for compression)
-        run: sudo apt update && sudo apt install -y upx-ucl
-
-      - name: Enable static linking for openlist2 (依赖组件)
+      # 步骤2：安装OpenWrt SDK编译依赖
+      - name: Install Build Dependencies
         run: |
-          # 针对openlist2的Makefile配置静态链接（旧版luci依赖openlist2）
-          sed -i '/golang-package/ s/$/\n\tGO_PKG_DEFAULT_LDFLAGS:=-w -s -extldflags "-static"/' openlist2/Makefile || echo "golang-package line not found in openlist2/Makefile"
+          sudo apt update && sudo apt install -y \
+          build-essential libncurses5-dev libncursesw5-dev \
+          zlib1g-dev gawk git gettext libssl-dev xsltproc wget unzip \
+          python3-distutils upx-ucl curl rsync file libelf-dev
 
-      - name: Add UPX compression for openlist2 (依赖组件)
-        run: |
-          # 针对openlist2的init脚本追加UPX压缩（不影响luci层，仅优化二进制）
-          sed -i '/openlist2.init/ s/$/\n\t\/usr\/bin\/upx --lzma --best $(1)\/usr\/bin\/openlist2/' openlist2/Makefile || echo "openlist2.init line not found in openlist2/Makefile"
-
-      - name: Build OpenWRT packages (Lua版 luci-app-openlist)
-        uses: sbwml/openwrt-gh-action-sdk@go1.25
+      # 步骤3：使用适配的SDK Action构建IPK（核心步骤）
+      - name: Build luci-app-openlist IPK via SDK
+        uses: sbwml/openwrt-gh-action-sdk@go1.20  # 降级Go版本适配旧SDK
         env:
           ARCH: ${{ matrix.arch }}
-          FEEDNAME: packages_ci
-          # 核心：指定构建旧版Lua版的luci-app-openlist（而非新版openlist2）
-          PACKAGES: luci-app-openlist
-          NO_REFRESH_CHECK: true
-          # 可选：若旧版luci依赖特定luci-compat版本，可追加依赖指定
-          # EXTRA_DEPENDS: +luci-compat
+          # 强制指定OpenWrt 21.02.7官方SDK地址
+          SDK_URL: https://downloads.openwrt.org/releases/21.02.7/targets/${{ matrix.arch }}/generic/
+          FEEDNAME: custom_feeds  # 自定义feed名称
+          PACKAGES: luci-app-openlist  # 仅构建目标应用
+          NO_REFRESH_CHECK: true  # 跳过SDK刷新检查
+          WORKDIR: ./openwrt-sdk  # SDK工作目录
+          # 源码路径映射：将检出的代码链接到SDK的feed目录
+          SOURCE_PATH: ${{ github.workspace }}/openwrt-packages
 
-      - name: Upload raw artifacts (ipk)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.sdk }}-${{ matrix.arch }}-raw
-          path: bin/packages/${{ matrix.arch }}/packages_ci/*.ipk
-
-      - name: Create compressed package archive
+      # 步骤4：验证IPK产物存在（无IPK则终止流程）
+      - name: Verify IPK File Exists
         run: |
-          if [ -d "bin/packages/${{ matrix.arch }}/packages_ci" ]; then
-            tar -zcvf ${{ matrix.sdk }}-${{ matrix.arch }}-luci-app-openlist.tar.gz -C bin/packages/${{ matrix.arch }}/ packages_ci
-            echo "COMPRESS_FILE_CREATED=true" >> $GITHUB_ENV
-          else
-            echo "No packages found for ${{ matrix.sdk }}-${{ matrix.arch }}"
-            echo "COMPRESS_FILE_CREATED=false" >> $GITHUB_ENV
+          # 列出产物目录，确认仅生成IPK
+          ls -la ./openwrt-sdk/bin/packages/${{ matrix.arch }}/custom_feeds/
+          # 检查IPK文件，不存在则报错退出
+          if [ -z "$(find ./openwrt-sdk/bin/packages/${{ matrix.arch }}/custom_feeds/ -name 'luci-app-openlist*.ipk')" ]; then
+            echo "ERROR: No luci-app-openlist IPK found!"
+            exit 1
           fi
 
-      - name: Upload packages to GitHub Release
-        if: env.COMPRESS_FILE_CREATED == 'true'
+      # 步骤5：上传原始IPK作为Action产物（便于临时下载）
+      - name: Upload Raw IPK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.sdk }}-${{ matrix.arch }}-luci-app-openlist-ipk
+          path: |
+            ./openwrt-sdk/bin/packages/${{ matrix.arch }}/custom_feeds/luci-app-openlist*.ipk
+            !./openwrt-sdk/bin/packages/${{ matrix.arch }}/custom_feeds/*.apk  # 强制排除APK
+
+      # 步骤6：将IPK打包为压缩包（便于Release分发）
+      - name: Package IPK to Tar.gz
+        run: |
+          IPK_DIR=./openwrt-sdk/bin/packages/${{ matrix.arch }}/custom_feeds/
+          cd $IPK_DIR
+          # 打包IPK为tar.gz（避免单个文件上传丢失）
+          tar -zcvf luci-app-openlist-${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz luci-app-openlist*.ipk
+          # 移动到工作根目录
+          mv luci-app-openlist-${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz ${{ github.workspace }}/
+
+      # 步骤7：上传压缩包到GitHub Release
+      - name: Upload IPK to GitHub Release
         uses: ncipollo/release-action@v1
         with:
+          # 标签：推送标签时用标签名，手动触发时用输入的tag
           tag: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
-          # 明确标注是Lua版，避免和新版混淆
-          name: Release ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }} - Lua版 luci-app-openlist - ${{ matrix.sdk }}-${{ matrix.arch }}
+          name: luci-app-openlist IPK (${{ matrix.sdk }}-${{ matrix.arch }})
           token: ${{ secrets.GITHUB_TOKEN }}
-          allowUpdates: true
-          replacesArtifacts: true
-          prerelease: false
-          artifacts: "${{ matrix.sdk }}-${{ matrix.arch }}-luci-app-openlist.tar.gz"
+          allowUpdates: true  # 允许更新已存在的Release
+          replacesArtifacts: true  # 替换同名产物
+          artifacts: ${{ github.workspace }}/luci-app-openlist-${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz
+          body: |
+            ## luci-app-openlist IPK 构建产物
+            - SDK版本：${{ matrix.sdk }}
+            - 架构：${{ matrix.arch }}
+            - 适配OpenWrt 21.02.7
+            - 包含文件：luci-app-openlist*.ipk
