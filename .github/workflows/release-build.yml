@@ -3,7 +3,6 @@ name: Build Packages
 on:
   workflow_dispatch:
     inputs:
-      # 手动触发时，允许手动输入标签名
       tag:
         description: 'Release tag (e.g. v1.0.0)'
         required: false
@@ -25,19 +24,25 @@ jobs:
           - openwrt-24.10
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Build with Static Linking
-        run: |
-          sed -i '/golang-package/a \\tGO_PKG_DEFAULT_LDFLAGS:=-w -s -extldflags "-static"' openlist2/Makefile
+      - name: Install UPX (dependency for compression)
+        run: sudo apt update && sudo apt install -y upx-ucl
 
-      - name: UPX Compress
+      - name: Enable static linking for Go package
         run: |
-          sed -i '/openlist2.init/a \\t/usr/bin/upx --lzma --best $(1)\/usr\/bin\/openlist2' openlist2/Makefile
+          # 更健壮的sed写法：匹配golang-package行后追加，不存在则不操作
+          sed -i '/golang-package/ s/$/\n\tGO_PKG_DEFAULT_LDFLAGS:=-w -s -extldflags "-static"/' openlist2/Makefile || echo "golang-package line not found in Makefile"
 
-      - name: Build Packages
+      - name: Add UPX compression step
+        run: |
+          # 匹配openlist2.init行后追加UPX压缩命令
+          sed -i '/openlist2.init/ s/$/\n\t\/usr\/bin\/upx --lzma --best $(1)\/usr\/bin\/openlist2/' openlist2/Makefile || echo "openlist2.init line not found in Makefile"
+
+      - name: Build OpenWRT packages
         uses: sbwml/openwrt-gh-action-sdk@go1.25
         env:
           ARCH: ${{ matrix.arch }}
@@ -45,31 +50,32 @@ jobs:
           PACKAGES: luci-app-openlist2
           NO_REFRESH_CHECK: true
 
-      - name: Upload artifacts
+      - name: Upload raw artifacts (ipk/apk)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.sdk }}-${{ matrix.arch }}
-          path: |
-            bin/packages/${{ matrix.arch }}/packages_ci/*.apk
-            bin/packages/riscv64_generic/packages_ci/*.apk
-            bin/packages/${{ matrix.arch }}/packages_ci/*.ipk
+          name: ${{ matrix.sdk }}-${{ matrix.arch }}-raw
+          path: bin/packages/${{ matrix.arch }}/packages_ci/*.ipk
 
-      - name: Create compress files
-        continue-on-error: true
+      - name: Create compressed package archive
         run: |
-          if [ "${{ matrix.arch }}" = "riscv64_riscv64" ] && [ "${{ matrix.sdk }}" = "SNAPSHOT" ]; then
-            tar -zcvf ${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz -C bin/packages/riscv64_generic/ packages_ci
-          else
+          # 先检查产物目录是否存在，避免压缩失败
+          if [ -d "bin/packages/${{ matrix.arch }}/packages_ci" ]; then
             tar -zcvf ${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz -C bin/packages/${{ matrix.arch }}/ packages_ci
+            echo "COMPRESS_FILE_CREATED=true" >> $GITHUB_ENV
+          else
+            echo "No packages found for ${{ matrix.sdk }}-${{ matrix.arch }}"
+            echo "COMPRESS_FILE_CREATED=false" >> $GITHUB_ENV
           fi
 
-      - name: Upload packages to Release
+      - name: Upload packages to GitHub Release
+        if: env.COMPRESS_FILE_CREATED == 'true'  # 仅当压缩文件存在时执行
         uses: ncipollo/release-action@v1
         with:
-          # 核心修复：指定 tag 参数，优先用触发的标签，手动触发时用输入的标签
-          tag: ${{ github.ref_name != 'refs/heads/main' && github.ref_name || github.event.inputs.tag }}
-          name: ${{ matrix.sdk }}-${{ matrix.arch }} # Release 名称改为编译的版本信息
-          token: ${{ secrets.GITHUB_TOKEN }} # 替换为你的 token 密钥
+          # 修正标签逻辑：标签推送时用触发的标签，手动触发时用输入的标签
+          tag: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+          # Release名称：标签+架构+SDK，避免覆盖
+          name: Release ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }} - ${{ matrix.sdk }}-${{ matrix.arch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           allowUpdates: true
           replacesArtifacts: true
           prerelease: false
