@@ -2,13 +2,19 @@ name: Build Packages
 
 on:
   workflow_dispatch:
+    inputs:
+      # 手动触发时，允许手动输入标签名
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: false
+        default: 'latest'
   push:
     tags:
-      - "*"
+      - "*"  # 推送任意标签时触发
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}-${{ matrix.sdk }}
+    name: Build ${{ matrix.sdk }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -34,7 +40,7 @@ jobs:
       - name: Build Packages
         uses: sbwml/openwrt-gh-action-sdk@go1.25
         env:
-          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          ARCH: ${{ matrix.arch }}
           FEEDNAME: packages_ci
           PACKAGES: luci-app-openlist2
           NO_REFRESH_CHECK: true
@@ -42,7 +48,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.arch }}-${{ matrix.sdk }}
+          name: ${{ matrix.sdk }}-${{ matrix.arch }}
           path: |
             bin/packages/${{ matrix.arch }}/packages_ci/*.apk
             bin/packages/riscv64_generic/packages_ci/*.apk
@@ -57,11 +63,13 @@ jobs:
             tar -zcvf ${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz -C bin/packages/${{ matrix.arch }}/ packages_ci
           fi
 
-      - name: Upload packages
+      - name: Upload packages to Release
         uses: ncipollo/release-action@v1
         with:
-          name: ${{ github.ref_name }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # 核心修复：指定 tag 参数，优先用触发的标签，手动触发时用输入的标签
+          tag: ${{ github.ref_name != 'refs/heads/main' && github.ref_name || github.event.inputs.tag }}
+          name: ${{ matrix.sdk }}-${{ matrix.arch }} # Release 名称改为编译的版本信息
+          token: ${{ secrets.GITHUB_TOKEN }} # 替换为你的 token 密钥
           allowUpdates: true
           replacesArtifacts: true
           prerelease: false
