@@ -10,7 +10,7 @@ PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 
 LUCI_TITLE:=LuCI support for openlist
-LUCI_DEPENDS:=+openlist +luci-compat
+LUCI_DEPENDS:=+openlist2 +luci-compat
 
 define Package/$(PKG_NAME)/postinst
 #!/bin/sh
