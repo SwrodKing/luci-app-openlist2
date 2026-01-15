@@ -1,0 +1,110 @@
+name: Build Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: false
+        default: 'latest'
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  FEED_NAME: packages_ci
+  PACKAGE_NAME: luci-app-openlist2
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}-${{ matrix.sdk }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64_cortex-a53
+          - x86_64
+        sdk:
+          - openwrt-24.10
+          - SNAPSHOT
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/openwrt
+          key: ${{ matrix.arch }}-${{ matrix.sdk }}-${{ hashFiles('**/Makefile') }}
+          restore-keys: |
+            ${{ matrix.arch }}-${{ matrix.sdk }}-
+
+      - name: Configure static linking
+        run: |
+          if [ ! -f "openlist2/Makefile" ]; then
+            echo "Error: openlist2/Makefile not found"
+            exit 1
+          fi
+          # 使用 $'\t' 确保制表符
+          sed -i '/golang-package/a \'$'\t''GO_PKG_LDFLAGS+=-w -s -extldflags "-static"' openlist2/Makefile || echo "Warning: Failed to add static linking flags"
+
+      - name: Configure UPX compression
+        if: !contains(fromJSON('["loongarch64_generic", "mips64_mips64r2", "mips64_octeonplus", "mips64el_mips64r2", "riscv64_riscv64"]'), matrix.arch)
+        run: |
+          sed -i '/openlist2.init/a \'$'\t''/usr/bin/upx --lzma --best $(1)/usr/bin/openlist2' openlist2/Makefile || echo "Warning: Failed to add UPX compression"
+
+      - name: Build packages
+        uses: sbwml/openwrt-gh-action-sdk@v1
+        timeout-minutes: 90
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          FEEDNAME: ${{ env.FEED_NAME }}
+          PACKAGES: ${{ env.PACKAGE_NAME }}
+          NO_REFRESH_CHECK: true
+
+      - name: Verify build artifacts
+        id: verify
+        run: |
+          artifact_dir=$(find bin/packages -type d -name "${{ env.FEED_NAME }}" | head -n1)
+          if [ -n "$artifact_dir" ]; then
+            echo "artifact_dir=$artifact_dir" >> $GITHUB_OUTPUT
+          else
+            echo "artifact_dir=" >> $GITHUB_OUTPUT
+            echo "❌ No artifacts found"
+          fi
+
+      - name: Upload artifacts
+        if: steps.verify.outputs.artifact_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-${{ matrix.sdk }}
+          compression-level: 9
+          path: ${{ steps.verify.outputs.artifact_dir }}/*
+          if-no-files-found: error
+
+      - name: Create archive
+        if: steps.verify.outputs.artifact_dir != ''
+        run: |
+          cd ${{ steps.verify.outputs.artifact_dir }}
+          tar -zcvf ${{ github.workspace }}/${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz ${{ env.FEED_NAME }}
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') && steps.verify.outputs.artifact_dir != ''
+        uses: ncipollo/release-action@v1
+        with:
+          name: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          replacesArtifacts: true
+          prerelease: false
+          artifacts: "${{ github.workspace }}/${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz"
