@@ -1,4 +1,4 @@
-name: Build Packages fix
+name: Build Packages
 
 on:
   workflow_dispatch:
@@ -10,21 +10,16 @@ on:
   push:
     tags:
       - "*"
-
-permissions:
-  contents: write
-  actions: write
-
 env:
   FEED_NAME: packages_ci
-  PACKAGE_NAME: luci-app-openlist2
+  PACKAGE_NAME: openlist2
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}-${{ matrix.sdk }}
+    name: Build ${{ matrix.sdk }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    
+
     strategy:
       fail-fast: false
       matrix:
@@ -36,10 +31,10 @@ jobs:
           - SNAPSHOT
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Cache SDK
         uses: actions/cache@v4
@@ -49,62 +44,51 @@ jobs:
           restore-keys: |
             ${{ matrix.arch }}-${{ matrix.sdk }}-
 
-      - name: Configure static linking
+      - name: Install UPX (dependency for compression)
         run: |
-          if [ ! -f "openlist2/Makefile" ]; then
-            echo "Error: openlist2/Makefile not found"
-            exit 1
-          fi
-          # 使用 $'\t' 确保制表符
-          sed -i '/golang-package/a \'$'\t''GO_PKG_LDFLAGS+=-w -s -extldflags "-static"' openlist2/Makefile || echo "Warning: Failed to add static linking flags"
+          sudo apt update && sudo apt install -y upx-ucl
 
-      - name: Configure UPX compression
-        if: !contains(fromJSON('["loongarch64_generic", "mips64_mips64r2", "mips64_octeonplus", "mips64el_mips64r2", "riscv64_riscv64"]'), matrix.arch)
+      - name: Enable static linking for Go package
         run: |
-          sed -i '/openlist2.init/a \'$'\t''/usr/bin/upx --lzma --best $(1)/usr/bin/openlist2' openlist2/Makefile || echo "Warning: Failed to add UPX compression"
+          sed -i '/golang-package/ s/$/\n\tGO_PKG_DEFAULT_LDFLAGS:=-w -s -extldflags "-static"/' ${{ env.PACKAGE_NAME }}/Makefile || echo "golang-package line not found in Makefile"
 
-      - name: Build packages
-        uses: sbwml/openwrt-gh-action-sdk@v1
+      - name: Add UPX compression step
+        run: |
+          sed -i '/${{ env.PACKAGE_NAME }}.init/ s/$/\n\t\/usr\/bin\/upx --lzma --best $(1)\/usr\/bin\/${{ env.PACKAGE_NAME }}/' ${{ env.PACKAGE_NAME }}/Makefile || echo "${{ env.PACKAGE_NAME }}.init line not found in Makefile"
+
+      - name: Build OpenWRT packages
+        uses: sbwml/openwrt-gh-action-sdk@go1.25
         timeout-minutes: 90
         env:
-          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          ARCH: ${{ matrix.arch }}
           FEEDNAME: ${{ env.FEED_NAME }}
-          PACKAGES: ${{ env.PACKAGE_NAME }}
+          PACKAGES: luci-app-${{ env.PACKAGE_NAME }}
           NO_REFRESH_CHECK: true
 
-      - name: Verify build artifacts
-        id: verify
-        run: |
-          artifact_dir=$(find bin/packages -type d -name "${{ env.FEED_NAME }}" | head -n1)
-          if [ -n "$artifact_dir" ]; then
-            echo "artifact_dir=$artifact_dir" >> $GITHUB_OUTPUT
-          else
-            echo "artifact_dir=" >> $GITHUB_OUTPUT
-            echo "❌ No artifacts found"
-          fi
-
-      - name: Upload artifacts
-        if: steps.verify.outputs.artifact_dir != ''
+      - name: Upload raw artifacts (ipk/apk)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.arch }}-${{ matrix.sdk }}
-          compression-level: 9
-          path: ${{ steps.verify.outputs.artifact_dir }}/*
-          if-no-files-found: error
+          name: ${{ matrix.sdk }}-${{ matrix.arch }}-raw
+          path: bin/packages/${{ matrix.arch }}/packages_ci/*.ipk
 
-      - name: Create archive
-        if: steps.verify.outputs.artifact_dir != ''
+      - name: Create compressed package archive
         run: |
-          cd ${{ steps.verify.outputs.artifact_dir }}
-          tar -zcvf ${{ github.workspace }}/${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz ${{ env.FEED_NAME }}
+          if [ -d "bin/packages/${{ matrix.arch }}/packages_ci" ]; then
+            tar -zcvf ${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz -C bin/packages/${{ matrix.arch }}/ packages_ci
+            echo "COMPRESS_FILE_CREATED=true" >> $GITHUB_ENV
+          else
+            echo "No packages found for ${{ matrix.sdk }}-${{ matrix.arch }}"
+            echo "COMPRESS_FILE_CREATED=false" >> $GITHUB_ENV
+          fi
 
-      - name: Upload to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') && steps.verify.outputs.artifact_dir != ''
+      - name: Upload packages to GitHub Release
+        if: env.COMPRESS_FILE_CREATED == 'true'
         uses: ncipollo/release-action@v1
         with:
-          name: ${{ github.ref_name }}
+          tag: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+          name: Release ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }} - ${{ matrix.sdk }}-${{ matrix.arch }}
           token: ${{ secrets.GITHUB_TOKEN }}
           allowUpdates: true
           replacesArtifacts: true
           prerelease: false
-          artifacts: "${{ github.workspace }}/${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz"
+          artifacts: "${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz"
